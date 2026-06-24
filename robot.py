@@ -9,7 +9,6 @@ from kinematics import (
     inverse_kinematics_2d,
     inverse_kinematics_alternative,
     get_joint_positions,
-    check_reachability,
     check_constraints
 )
 from dynamics import (
@@ -36,7 +35,10 @@ class Robot:
                  I_z2=0.1, I_z3=0.05,  # моменты инерции
                  z_min=0.0, z_max=1.5,  # ограничения по высоте
                  psi_min=-np.pi, psi_max=np.pi,  # ограничения по углам
-                 g=9.81):  # ускорение свободного падения
+                 g=9.81,  # ускорение свободного падения
+                 max_velocity=2.0,  # максимальная скорость (рад/с, м/с)
+                 max_acceleration=5.0,  # максимальное ускорение (рад/с², м/с²)
+                 max_torque=10.0):  # максимальный момент/сила
         """
         Создание робота с заданными параметрами.
 
@@ -47,6 +49,9 @@ class Robot:
             z_min, z_max (float): диапазон высоты (м)
             psi_min, psi_max (float): диапазон угла psi (рад)
             g (float): ускорение свободного падения (м/с²)
+            max_velocity (float): максимальная скорость (рад/с, м/с)
+            max_acceleration (float): максимальное ускорение (рад/с², м/с²)
+            max_torque (float): максимальный момент/сила
         """
         # === Параметры робота ===
         self.L1 = L1
@@ -63,6 +68,9 @@ class Robot:
         self.z_max = z_max
         self.psi_min = psi_min
         self.psi_max = psi_max
+        self.max_velocity = max_velocity
+        self.max_acceleration = max_acceleration
+        self.max_torque = max_torque
 
         # === Текущее состояние ===
         self.z = 0.0
@@ -120,7 +128,10 @@ class Robot:
             'g': self.g,
             'z_range': (self.z_min, self.z_max),
             'psi_range': (self.psi_min, self.psi_max),
-            'reachability_range': (abs(self.L1 - self.L2), self.L1 + self.L2)
+            'reachability_range': (abs(self.L1 - self.L2), self.L1 + self.L2),
+            'max_velocity': self.max_velocity,
+            'max_acceleration': self.max_acceleration,
+            'max_torque': self.max_torque
         }
 
     # ============================================================
@@ -229,6 +240,78 @@ class Robot:
     # 3. ДИНАМИКА
     # ============================================================
 
+    def compute_accelerations_from_time(self, target_z, target_psi, target_xi, T):
+        """
+        Вычисляет ускорения, необходимые для достижения цели за время T.
+
+        Формула для равноускоренного движения с нулевой начальной скоростью:
+            q_target = q_start + 0.5 * a * T^2
+            a = 2 * (q_target - q_start) / T^2
+
+        Параметры:
+            target_z, target_psi, target_xi (float): целевые координаты
+            T (float): время движения (сек)
+
+        Возвращает:
+            tuple: (ddz, ddpsi, ddxi)
+        """
+        dz = target_z - self.z
+        dpsi = target_psi - self.psi
+        dxi = target_xi - self.xi
+
+        ddz = 2 * dz / (T ** 2)
+        ddpsi = 2 * dpsi / (T ** 2)
+        ddxi = 2 * dxi / (T ** 2)
+
+        # Проверка на превышение максимального ускорения
+        if abs(ddz) > self.max_acceleration:
+            print(f"Предупреждение: ускорение ddz={ddz:.2f} превышает максимум {self.max_acceleration:.2f}")
+        if abs(ddpsi) > self.max_acceleration:
+            print(f"Предупреждение: ускорение ddpsi={ddpsi:.2f} превышает максимум {self.max_acceleration:.2f}")
+        if abs(ddxi) > self.max_acceleration:
+            print(f"Предупреждение: ускорение ddxi={ddxi:.2f} превышает максимум {self.max_acceleration:.2f}")
+
+        return ddz, ddpsi, ddxi
+
+    def plan_trajectory(self, target_z, target_psi, target_xi, n_steps=50):
+        """
+        Создаёт простую траекторию от текущего состояния к целевому.
+
+        Параметры:
+            target_z, target_psi, target_xi (float): целевые координаты
+            n_steps (int): количество шагов
+
+        Возвращает:
+            list: траектория [(z, psi, xi), ...]
+        """
+        trajectory = []
+        for i in range(n_steps + 1):
+            t = i / n_steps
+            # Линейная интерполяция
+            z = self.z + t * (target_z - self.z)
+            psi = self.psi + t * (target_psi - self.psi)
+            xi = self.xi + t * (target_xi - self.xi)
+            trajectory.append((z, psi, xi))
+        return trajectory
+
+    def plan_trajectory_with_time(self, target_z, target_psi, target_xi, T, freq=50):
+        """
+        Планирует траекторию на время T с частотой freq Гц.
+
+        Параметры:
+            target_z, target_psi, target_xi (float): целевые координаты
+            T (float): время движения (сек)
+            freq (int): частота обновления (Гц)
+
+        Возвращает:
+            list: траектория [(z, psi, xi), ...]
+        """
+        n_steps = int(T * freq)
+        if n_steps < 10:
+            n_steps = 10
+            print(f"Предупреждение: слишком мало шагов ({n_steps}), установлено минимум 10")
+        return self.plan_trajectory(target_z, target_psi, target_xi, n_steps)
+
     def compute_dynamics(self, ddz=0.0, ddpsi=0.0, ddxi=0.0):
         """
         Вычислить требуемые усилия для заданных ускорений.
@@ -260,20 +343,35 @@ class Robot:
         constraints_ok = True
         messages = []
 
-        # Скорости
-        ok, msgs = check_velocity_constraints(self.dz, self.dpsi, self.dxi)
+        # Скорости (используем max_velocity)
+        ok, msgs = check_velocity_constraints(
+            self.dz, self.dpsi, self.dxi,
+            dz_max=self.max_velocity,
+            dpsi_max=self.max_velocity,
+            dxi_max=self.max_velocity
+        )
         if not ok:
             constraints_ok = False
             messages.extend(msgs)
 
-        # Ускорения
-        ok, msgs = check_acceleration_constraints(ddz, ddpsi, ddxi)
+        # Ускорения (используем max_acceleration)
+        ok, msgs = check_acceleration_constraints(
+            ddz, ddpsi, ddxi,
+            ddz_max=self.max_acceleration,
+            ddpsi_max=self.max_acceleration,
+            ddxi_max=self.max_acceleration
+        )
         if not ok:
             constraints_ok = False
             messages.extend(msgs)
 
-        # Усилия
-        ok, msgs = check_torque_constraints(tau[0], tau[1], tau[2])
+        # Усилия (используем max_torque)
+        ok, msgs = check_torque_constraints(
+            tau[0], tau[1], tau[2],
+            F_z_max=self.max_torque,
+            M_psi_max=self.max_torque,
+            M_xi_max=self.max_torque
+        )
         if not ok:
             constraints_ok = False
             messages.extend(msgs)
@@ -285,6 +383,85 @@ class Robot:
             'tau': tau,
             'constraints_ok': constraints_ok,
             'messages': messages
+        }
+
+    def compute_dynamics_for_trajectory(self, trajectory, freq=50):
+        """
+        Вычисляет динамику для всей траектории.
+
+        Параметры:
+            trajectory (list): список состояний [(z, psi, xi), ...]
+            freq (int): частота обновления (Гц)
+
+        Возвращает:
+            dict: {
+                'times': list,
+                'tau': list,
+                'states': list,  # (z, psi, xi, dz, dpsi, dxi)
+                'constraints_ok': bool,
+                'messages': list
+            }
+        """
+        times = []
+        tau_list = []
+        states_list = []
+        all_messages = []
+        constraints_ok = True
+
+        dt = 1.0 / freq
+
+        for i, state in enumerate(trajectory):
+            z, psi, xi = state
+
+            # Вычисляем скорости (конечные разности)
+            if i == 0:
+                dz = 0.0
+                dpsi = 0.0
+                dxi = 0.0
+            else:
+                prev_state = trajectory[i - 1]
+                dz = (z - prev_state[0]) / dt
+                dpsi = (psi - prev_state[1]) / dt
+                dxi = (xi - prev_state[2]) / dt
+
+            # Вычисляем ускорения (конечные разности)
+            if i == 0 or i == 1:
+                ddz = 0.0
+                ddpsi = 0.0
+                ddxi = 0.0
+            else:
+                prev_prev_state = trajectory[i - 2]
+                ddz = (z - 2 * prev_state[0] + prev_prev_state[0]) / (dt ** 2)
+                ddpsi = (psi - 2 * prev_state[1] + prev_prev_state[1]) / (dt ** 2)
+                ddxi = (xi - 2 * prev_state[2] + prev_prev_state[2]) / (dt ** 2)
+
+            # ОБНОВЛЯЕМ СОСТОЯНИЕ с вычисленными скоростями
+            self.set_state(z, psi, xi, dz, dpsi, dxi)
+
+            # Сохраняем состояние с скоростями
+            states_list.append((z, psi, xi, dz, dpsi, dxi))
+
+            # Вычисляем усилия
+            result = self.compute_dynamics(ddz, ddpsi, ddxi)
+
+            times.append(i * dt)
+            tau_list.append(result['tau'])
+
+            if not result['constraints_ok']:
+                constraints_ok = False
+                all_messages.extend(result['messages'])
+
+        # Возвращаем начальное состояние (чтобы не испортить робота)
+        if states_list:
+            first_state = states_list[0]
+            self.set_state(first_state[0], first_state[1], first_state[2], 0, 0, 0)
+
+        return {
+            'times': times,
+            'tau': tau_list,
+            'states': states_list,
+            'constraints_ok': constraints_ok,
+            'messages': list(set(all_messages))
         }
 
     def compute_static_torques(self):
@@ -315,32 +492,7 @@ class Robot:
         )
 
     # ============================================================
-    # 5. ПЛАНИРОВАНИЕ ТРАЕКТОРИИ
-    # ============================================================
-
-    def plan_trajectory(self, target_z, target_psi, target_xi, n_steps=50):
-        """
-        Создаёт простую траекторию от текущего состояния к целевому.
-
-        Параметры:
-            target_z, target_psi, target_xi (float): целевые координаты
-            n_steps (int): количество шагов
-
-        Возвращает:
-            list: траектория [(z, psi, xi), ...]
-        """
-        trajectory = []
-        for i in range(n_steps + 1):
-            t = i / n_steps
-            # Линейная интерполяция
-            z = self.z + t * (target_z - self.z)
-            psi = self.psi + t * (target_psi - self.psi)
-            xi = self.xi + t * (target_xi - self.xi)
-            trajectory.append((z, psi, xi))
-        return trajectory
-
-    # ============================================================
-    # 6. ВЫВОД ИНФОРМАЦИИ
+    # 5. ВЫВОД ИНФОРМАЦИИ
     # ============================================================
 
     def __str__(self):
@@ -367,4 +519,7 @@ class Robot:
         print(f"  Диапазон z: {info['z_range']}")
         print(f"  Диапазон ψ: {info['psi_range']}")
         print(f"  Достижимость: {info['reachability_range']}")
+        print(f"  Макс. скорость: {info['max_velocity']:.1f}")
+        print(f"  Макс. ускорение: {info['max_acceleration']:.1f}")
+        print(f"  Макс. усилие: {info['max_torque']:.1f}")
         print("=" * 50)
